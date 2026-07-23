@@ -52,23 +52,51 @@ class N8nServiceAPIRunner(runner.RequestRunner):
             self.header_name = self.pipeline_config['ai']['n8n-service-api'].get('header-name', '')
             self.header_value = self.pipeline_config['ai']['n8n-service-api'].get('header-value', '')
 
-    async def _preprocess_user_message(self, query: pipeline_query.Query) -> str:
-        """预处理用户消息，提取纯文本
+    async def _preprocess_user_message(self, query: pipeline_query.Query) -> dict:
+        """预处理用户消息，提取纯文本和附件信息
 
         Returns:
-            str: 纯文本消息
+            dict: {
+                'plain_text': str,           # 文本内容
+                'attachments': list[dict],   # 附件列表
+            }
         """
         plain_text = ''
+        attachments = []
 
         if isinstance(query.user_message.content, list):
             for ce in query.user_message.content:
                 if ce.type == 'text':
                     plain_text += ce.text
-                # 注意：n8n webhook目前不支持直接处理图片，如需支持可在此扩展
+                elif ce.type == 'file_url':
+                    attachments.append({
+                        'type': 'file_url',
+                        'url': ce.file_url,
+                        'name': ce.file_name or '',
+                    })
+                    plain_text += f'\n[File: {ce.file_name or "unnamed"}]({ce.file_url})'
+                elif ce.type == 'file_base64':
+                    attachments.append({
+                        'type': 'file_base64',
+                        'name': ce.file_name or '',
+                    })
+                    plain_text += f'\n[File: {ce.file_name or "unnamed"}](base64)'
+                elif ce.type == 'image_url':
+                    url = ce.image_url.url if ce.image_url else ''
+                    attachments.append({
+                        'type': 'image_url',
+                        'url': url,
+                    })
+                    plain_text += f'\n[Image]({url})'
+                elif ce.type == 'image_base64':
+                    attachments.append({
+                        'type': 'image_base64',
+                    })
+                    plain_text += '\n[Image](base64)'
         elif isinstance(query.user_message.content, str):
             plain_text = query.user_message.content
 
-        return plain_text
+        return {'plain_text': plain_text, 'attachments': attachments}
 
     async def _process_response(
         self, response: aiohttp.ClientResponse
@@ -188,25 +216,35 @@ class N8nServiceAPIRunner(runner.RequestRunner):
             query.session.using_conversation.uuid = str(uuid.uuid4())
 
         # Keep query variables in sync with the generated/new conversation id.
-        # query.variables is later merged into payload and would otherwise
-        # overwrite the generated conversation_id with the stale preprocessor
-        # value (usually None for a new conversation).
         query.variables['conversation_id'] = query.session.using_conversation.uuid
 
-        # 预处理用户消息
-        plain_text = await self._preprocess_user_message(query)
+        # 预处理用户消息（含附件）
+        msg_data = await self._preprocess_user_message(query)
+        plain_text = msg_data['plain_text']
+        attachments = msg_data['attachments']
 
         # 准备请求数据
         payload = {
             # 基本消息内容
-            'chatInput': plain_text,  # 考虑到之前用户直接用的message model这里添加新键
+            'chatInput': plain_text,
             'message': plain_text,
             'user_message_text': plain_text,
             'conversation_id': query.session.using_conversation.uuid,
             'session_id': query.variables.get('session_id', ''),
             'user_id': f'{query.session.launcher_type.value}_{query.session.launcher_id}',
             'msg_create_time': query.variables.get('msg_create_time', ''),
+            'attachments': attachments,
         }
+
+        # 如果有文件URL附件，添加便捷字段（第一个文件）
+        if attachments:
+            first_file = next((a for a in attachments if a['type'] in ('file_url', 'file_base64')), None)
+            if first_file:
+                payload['file_url'] = first_file.get('url', '')
+                payload['file_name'] = first_file.get('name', '')
+            first_image = next((a for a in attachments if a['type'] in ('image_url', 'image_base64')), None)
+            if first_image:
+                payload['image_url'] = first_image.get('url', '')
 
         # 添加所有变量到payload
         payload.update(query.variables)
